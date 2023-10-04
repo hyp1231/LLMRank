@@ -7,6 +7,7 @@ import numpy as np
 from tqdm import tqdm
 import pylcs
 import html
+import replicate
 from recbole.model.abstract_recommender import SequentialRecommender
 
 from utils import dispatch_openai_requests, dispatch_single_openai_requests
@@ -94,7 +95,10 @@ class Rank(SequentialRecommender):
             prompt = self.construct_prompt(self.dataset_name, user_his_text, candidate_text_order)
             prompt_list.append([{'role': 'user', 'content': prompt}])
 
-        openai_responses = self.dispatch_openai_api_requests(prompt_list, batch_size)
+        if 'llama' in self.api_model_name:
+            openai_responses = self.dispatch_replicate_api_requests(prompt_list, batch_size)
+        else:
+            openai_responses = self.dispatch_openai_api_requests(prompt_list, batch_size)
 
         scores = torch.full((idxs.shape[0], self.n_items), -10000.)
         for i, openai_response in enumerate(tqdm(openai_responses)):
@@ -102,7 +106,10 @@ class Rank(SequentialRecommender):
             while retry_flag >= 0:
                 user_his_text, candidate_text, candidate_text_order, candidate_idx = self.get_batch_inputs(interaction, idxs, i)
 
-                response = openai_response['choices'][0]['message']['content']
+                if 'llama' in self.api_model_name:
+                    response = openai_response
+                else:
+                    response = openai_response['choices'][0]['message']['content']
                 response_list = response.split('\n')
                 
                 self.logger.info(prompt_list[i])
@@ -125,18 +132,21 @@ class Rank(SequentialRecommender):
                         self.logger.info(f'Ground-truth [{target_text}]: Ranks {ground_truth_pr}')
                         retry_flag = -1
                     except:
-                        self.logger.info(f'Fail to find ground-truth items.')
-                        print(target_text)
-                        print(rec_item_idx_list)
-                        print(f'Remaining {retry_flag} times to retry.')
-                        retry_flag -= 1
-                        while True:
-                            try:
-                                openai_response = dispatch_single_openai_requests(prompt_list[i], self.api_model_name, self.temperature)
-                                break
-                            except Exception as e:
-                                print(f'Error {e}, retry at {time.ctime()}', flush=True)
-                                time.sleep(20)
+                        if 'llama' in self.api_model_name:
+                            retry_flag = -1
+                        else:
+                            self.logger.info(f'Fail to find ground-truth items.')
+                            print(target_text)
+                            print(rec_item_idx_list)
+                            print(f'Remaining {retry_flag} times to retry.')
+                            retry_flag -= 1
+                            while True:
+                                try:
+                                    openai_response = dispatch_single_openai_requests(prompt_list[i], self.api_model_name, self.temperature)
+                                    break
+                                except Exception as e:
+                                    print(f'Error {e}, retry at {time.ctime()}', flush=True)
+                                    time.sleep(20)
                 else:
                     retry_flag = -1
 
@@ -197,6 +207,28 @@ class Rank(SequentialRecommender):
                 openai_responses.append(dispatch_single_openai_requests(message, self.api_model_name, self.temperature))
         self.logger.info('Received OpenAI Responses')
         return openai_responses
+    
+    def dispatch_replicate_api_requests(self, prompt_list, batch_size):
+        responses = []
+        self.logger.info('Launch Replicate APIs')
+        suffix = {
+            'llama-2-7b-chat': '4b0970478e6123a0437561282904683f32a9ed0307205dc5db2b5609d6a2ceff',
+            'llama-2-70b-chat': '2c1608e18606fad2812020dc541930f2d0495ce32eee50074220b87300bc16e1'
+        }[self.api_model_name]
+        for message in tqdm(prompt_list):
+            while True:
+                try:
+                    output = replicate.run(
+                        f"meta/{self.api_model_name}:{suffix}",
+                        input={"prompt": f"[INST] <<SYS>>\nYou are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature. If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information.\n<</SYS>>\n{message[0]['content']}[/INST]"}
+                    )
+                    break
+                except Exception as e:
+                    print(f'Error {e}, retry at {time.ctime()}', flush=True)
+                    time.sleep(20)
+
+            responses.append(''.join([_ for _ in output]))
+        return responses
 
     def parsing_output_text(self, scores, i, response_list, idxs, candidate_text):
         rec_item_idx_list = []
